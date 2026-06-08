@@ -1,0 +1,314 @@
+import os
+import json
+import gzip
+from tqdm import tqdm
+import torch
+from PIL import Image
+
+from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+
+
+
+def parse_gz_json_lines(path: str):
+    """Amazon reviews_*.json.gz: each line is a python dict string, can be eval-ed."""
+    with gzip.open(path, "r") as g:
+        for l in g:
+            yield eval(l)
+
+
+
+def build_itemmap_from_reviews(reviews_gz_path: str):
+    """
+    Build asin -> itemid mapping from reviews_*.json.gz
+    itemid starts from 1
+    """
+    itemmap = {}
+    itemnum = 1
+    for one_interaction in parse_gz_json_lines(reviews_gz_path):
+        asin = one_interaction["asin"]
+        if asin not in itemmap:
+            itemmap[asin] = itemnum
+            itemnum += 1
+    return itemmap
+
+
+
+def list_existing_image_asins(image_dir: str):
+    """Return a set of asins that have image files in image_dir."""
+    if not os.path.isdir(image_dir):
+        raise FileNotFoundError(f"Image dir not found: {image_dir}")
+    asins = set()
+    for fn in os.listdir(image_dir):
+        # expect {asin}.png (or jpg). handle common suffixes
+        base, ext = os.path.splitext(fn)
+        if ext.lower() in [".png", ".jpg", ".jpeg", ".webp"]:
+            asins.add(base)
+    return asins
+
+
+
+def find_image_pad_id(tokenizer):
+    """
+    Try to find the special token used to represent image patch placeholders in input_ids.
+    Different versions may use different names.
+    """
+    candidates = [
+        "<|image_pad|>",
+        "<|vision_pad|>",
+        "<|img_pad|>",
+        "<image_pad>",
+        "<vision_pad>",
+        "<image_soft_token>",
+        "<image>",
+    ]
+    for tok in candidates:
+        try:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if tid is not None and tid != tokenizer.unk_token_id:
+                return tid, tok
+        except Exception:
+            pass
+    return None, None
+
+
+
+def safe_resize_min_side(img: Image.Image, min_side: int = 28):
+
+    w, h = img.size
+    if min(w, h) >= min_side:
+        return img
+    scale = min_side / float(min(w, h))
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    return img.resize((new_w, new_h), Image.BICUBIC)
+
+
+
+def get_lm_device(model):
+    """
+    Get device for text embeddings (LLM side).
+    """
+    candidates = [
+        lambda m: next(m.model.embed_tokens.parameters()).device,
+        lambda m: next(m.language_model.model.embed_tokens.parameters()).device,
+        lambda m: next(m.language_model.get_input_embeddings().parameters()).device,
+        lambda m: next(m.get_input_embeddings().parameters()).device,
+    ]
+    for fn in candidates:
+        try:
+            return fn(model)
+        except Exception:
+            pass
+    return next(model.parameters()).device
+
+
+
+def get_vision_device(model):
+    """Get device for vision tower."""
+    candidates = [
+        lambda m: next(m.visual.parameters()).device,
+        lambda m: next(m.vision_tower.parameters()).device,
+        lambda m: next(m.vision_model.parameters()).device,
+        lambda m: next(m.multi_modal_projector.parameters()).device,
+    ]
+    for fn in candidates:
+        try:
+            return fn(model)
+        except Exception:
+            pass
+    return next(model.parameters()).device
+
+
+
+def move_inputs_to_devices(inputs, lm_device, vision_device):
+    for k in list(inputs.keys()):
+        v = inputs[k]
+        if not torch.is_tensor(v):
+            continue
+        if k in ["input_ids", "attention_mask", "position_ids", "token_type_ids"]:
+            inputs[k] = v.to(lm_device)
+        elif "pixel_values" in k or "image" in k or "video" in k or "grid" in k:
+            inputs[k] = v.to(vision_device)
+        else:
+            try:
+                inputs[k] = v.to(lm_device)
+            except Exception:
+                pass
+    return inputs
+
+
+
+def main():
+
+    MODEL_PATH = "OpenGVLab/InternVL3-8B-hf" # InternVL3-8B-hf / InternVL3-14B-hf / InternVL3-38B-hf
+
+    DATASET_DIR = "Home/"
+
+    # reviews gzip
+    REVIEWS_GZ = os.path.join(DATASET_DIR, "reviews_Home_5.json.gz")
+
+    IMAGE_DIR = os.path.join(DATASET_DIR, "image_text", "Home_image")
+
+    # prompt json (asin -> prompt)
+    PROMPT_JSON = os.path.join(DATASET_DIR, "image_text", "Home_prompt.json")
+
+    SAVE_DIR = os.path.join("Features", DATASET_DIR)
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    SAVE_PATH = os.path.join(SAVE_DIR, "internvl3_prompt_image_features.pt")
+
+
+    MAX_IMAGE_SIDE_LIMIT = None
+    DEFAULT_PROMPT = "Describe the main product in this image."
+
+    USE_4BIT = True
+    # ----------------------------------------
+
+    print("Loading prompts:", PROMPT_JSON)
+    with open(PROMPT_JSON, "r") as f:
+        prompt_dict = json.load(f)  # asin(str)->prompt(str)
+
+    print("Building itemmap from:", REVIEWS_GZ)
+    itemmap = build_itemmap_from_reviews(REVIEWS_GZ)
+    print("Total items from reviews:", len(itemmap))
+
+    print("Indexing existing images from:", IMAGE_DIR)
+    existing_asins = list_existing_image_asins(IMAGE_DIR)
+    print("Total images found:", len(existing_asins))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("device =", device)
+
+    bnb_config = None
+    if USE_4BIT:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+
+    print("Loading model:", MODEL_PATH)
+    model = AutoModelForImageTextToText.from_pretrained(
+        MODEL_PATH,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="sdpa",
+        quantization_config=bnb_config,
+    )
+    processor = AutoProcessor.from_pretrained(MODEL_PATH)
+
+    model.eval()
+
+    vision_device = get_vision_device(model)
+    lm_device = get_lm_device(model)
+    print("vision_device =", vision_device)
+    print("lm_device     =", lm_device)
+
+    image_pad_id, image_pad_tok = find_image_pad_id(processor.tokenizer)
+    print("image_pad_tok =", image_pad_tok, "image_pad_id =", image_pad_id)
+
+    feats_cpu = [None] * len(itemmap)  # index by (itemid-1)
+    feat_dim = None
+    missing_cnt = 0
+
+    torch.manual_seed(2025)
+
+    for asin, itemid in tqdm(itemmap.items(), total=len(itemmap)):
+        # itemid starts from 1
+        out_index = itemid - 1
+
+        img_path = None
+        for ext in [".png", ".jpg", ".jpeg", ".webp"]:
+            p = os.path.join(IMAGE_DIR, f"{asin}{ext}")
+            if os.path.exists(p):
+                img_path = p
+                break
+
+        if (asin in existing_asins) and (img_path is not None):
+            img = Image.open(img_path).convert("RGB")
+
+            img = safe_resize_min_side(img, min_side=28)
+
+            if MAX_IMAGE_SIDE_LIMIT is not None:
+                w, h = img.size
+                max_side = max(w, h)
+                if max_side > MAX_IMAGE_SIDE_LIMIT:
+                    scale = MAX_IMAGE_SIDE_LIMIT / float(max_side)
+                    img = img.resize((int(round(w * scale)), int(round(h * scale))), Image.BICUBIC)
+
+            prompt = prompt_dict.get(str(asin), DEFAULT_PROMPT)
+
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": prompt},
+                ],
+            }]
+
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+
+            inputs = processor(
+                text=[text],
+                images=[img],
+                padding=True,
+                return_tensors="pt",
+            )
+
+            inputs = move_inputs_to_devices(inputs, lm_device, vision_device)
+
+            with torch.no_grad():
+                out = model(**inputs, output_hidden_states=True, return_dict=True)
+
+                if hasattr(out, "image_hidden_states") and out.image_hidden_states is not None:
+                    image_hidden = out.image_hidden_states
+                    if isinstance(image_hidden, (tuple, list)):
+                        image_hidden = image_hidden[-1]
+                    if image_hidden.dim() == 3:
+                        pooled = image_hidden.mean(dim=1)
+                    else:
+                        pooled = image_hidden.mean(dim=0, keepdim=True)
+                else:
+                    last_hidden = out.hidden_states[-1]
+                    img_mask = None
+                    if image_pad_id is not None and "input_ids" in inputs:
+                        img_mask = (inputs["input_ids"] == image_pad_id)
+
+                    if img_mask is None or img_mask.sum().item() == 0:
+                        pooled = last_hidden.mean(dim=1)
+                    else:
+                        img_tokens = last_hidden[0][img_mask[0]]
+                        pooled = img_tokens.mean(dim=0, keepdim=True)
+
+                feat = pooled
+                feat = feat / (feat.norm(dim=-1, keepdim=True) + 1e-12)  # L2 norm
+
+                if feat_dim is None:
+                    feat_dim = feat.shape[-1]
+
+                feats_cpu[out_index] = feat.detach().to("cpu")
+
+        else:
+            missing_cnt += 1
+            feats_cpu[out_index] = None
+
+    print("missing images:", missing_cnt)
+
+    if feat_dim is None:
+        raise RuntimeError("No valid images found, cannot infer embedding dim.")
+
+    for i in range(len(feats_cpu)):
+        if feats_cpu[i] is None:
+            rand = torch.normal(mean=0.0, std=0.02, size=(1, feat_dim))
+            rand = rand / (rand.norm(dim=-1, keepdim=True) + 1e-12)
+            feats_cpu[i] = rand
+
+    feats = torch.cat(feats_cpu, dim=0)  # [num_items, feat_dim]
+    torch.save(feats, SAVE_PATH)
+    print("Saved:", SAVE_PATH, "shape:", tuple(feats.shape))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1 @@
+from recbole_model.HM4SR import HM4SR
